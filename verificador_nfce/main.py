@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QSpinBox,
     QSystemTrayIcon, QMenu, QAction, QTabWidget, QComboBox, QDateEdit
 )
-from PyQt5.QtCore import Qt, QDate
+from PyQt5.QtCore import Qt, QDate, pyqtSignal
 from PyQt5.QtGui import QIcon
 import concurrent.futures
 
@@ -19,6 +19,9 @@ CONFIG_FILE = 'config.json'
 LOG_FILE = 'log.txt'
 
 class VerificadorNFCe(QWidget):
+    status_signal = pyqtSignal(str, str, str, str)
+    status_geral_signal = pyqtSignal(str, str, str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Verificador NFC-e')
@@ -30,6 +33,9 @@ class VerificadorNFCe(QWidget):
         self.primeira_verificacao = True
         self.tray_icon = None
         self.create_tray_icon()
+        # Conectar sinais
+        self.status_signal.connect(self._adicionar_status_threadsafe)
+        self.status_geral_signal.connect(self._adicionar_status_geral_threadsafe)
         # Inicia o monitoramento automaticamente
         self.toggle_monitoramento()
 
@@ -228,6 +234,10 @@ class VerificadorNFCe(QWidget):
 
     def log_operacao(self, arquivo, status, data, hora, erro=None):
         try:
+            # Limitar o tamanho do log a 1MB
+            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 1024 * 1024:
+                with open(LOG_FILE, 'w', encoding='utf-8') as f:
+                    f.write('')  # Limpa o log
             with open(LOG_FILE, 'a', encoding='utf-8') as f:
                 linha = f'{data} {hora} | {arquivo} | {status}'
                 if erro:
@@ -237,32 +247,17 @@ class VerificadorNFCe(QWidget):
             print(f'Erro ao registrar log: {e}')
 
     def adicionar_status(self, arquivo, status):
-        row = self.status_table.rowCount()
-        self.status_table.insertRow(row)
         agora = datetime.datetime.now()
         data_str = agora.strftime('%d/%m/%Y')
         hora_str = agora.strftime('%H:%M:%S')
-        self.status_table.setItem(row, 0, QTableWidgetItem(arquivo))
-        self.status_table.setItem(row, 1, QTableWidgetItem(status))
-        self.status_table.setItem(row, 2, QTableWidgetItem(data_str))
-        self.status_table.setItem(row, 3, QTableWidgetItem(hora_str))
+        self.status_signal.emit(arquivo, status, data_str, hora_str)
         self.log_operacao(arquivo, status, data_str, hora_str)
 
     def adicionar_status_geral(self, status):
-        # Remove linha geral anterior, se existir
-        if self.status_table.rowCount() > 0:
-            last_row = self.status_table.rowCount() - 1
-            if self.status_table.item(last_row, 0) and self.status_table.item(last_row, 0).text() == '---':
-                self.status_table.removeRow(last_row)
-        row = self.status_table.rowCount()
-        self.status_table.insertRow(row)
         agora = datetime.datetime.now()
         data_str = agora.strftime('%d/%m/%Y')
         hora_str = agora.strftime('%H:%M:%S')
-        self.status_table.setItem(row, 0, QTableWidgetItem('---'))
-        self.status_table.setItem(row, 1, QTableWidgetItem(status))
-        self.status_table.setItem(row, 2, QTableWidgetItem(data_str))
-        self.status_table.setItem(row, 3, QTableWidgetItem(hora_str))
+        self.status_geral_signal.emit(status, data_str, hora_str)
 
     def validar_xml(self, caminho_arquivo):
         try:
@@ -271,23 +266,43 @@ class VerificadorNFCe(QWidget):
         except Exception:
             return False
 
+    def _adicionar_status_threadsafe(self, arquivo, status, data_str, hora_str):
+        row = self.status_table.rowCount()
+        self.status_table.insertRow(row)
+        self.status_table.setItem(row, 0, QTableWidgetItem(arquivo))
+        self.status_table.setItem(row, 1, QTableWidgetItem(status))
+        self.status_table.setItem(row, 2, QTableWidgetItem(data_str))
+        self.status_table.setItem(row, 3, QTableWidgetItem(hora_str))
+
+    def _adicionar_status_geral_threadsafe(self, status, data_str, hora_str):
+        if self.status_table.rowCount() > 0:
+            last_row = self.status_table.rowCount() - 1
+            if self.status_table.item(last_row, 0) and self.status_table.item(last_row, 0).text() == '---':
+                self.status_table.removeRow(last_row)
+        row = self.status_table.rowCount()
+        self.status_table.insertRow(row)
+        self.status_table.setItem(row, 0, QTableWidgetItem('---'))
+        self.status_table.setItem(row, 1, QTableWidgetItem(status))
+        self.status_table.setItem(row, 2, QTableWidgetItem(data_str))
+        self.status_table.setItem(row, 3, QTableWidgetItem(hora_str))
+
     def processar_arquivo(self, arquivo, caminho_arquivo, ano, mes, pdv, pasta_destino, destino_final, mostrar_ja_existe, data_str, hora_str):
-        if os.path.exists(destino_final):
-            if mostrar_ja_existe:
-                self.adicionar_status(arquivo, 'Já existe')
-            self.log_operacao(arquivo, 'Já existe', data_str, hora_str)
-            return 0
-        if not self.validar_xml(caminho_arquivo):
-            self.adicionar_status(arquivo, 'XML Inválido')
-            self.log_operacao(arquivo, 'XML Inválido', data_str, hora_str)
-            return 0
         try:
+            if os.path.exists(destino_final):
+                if mostrar_ja_existe:
+                    self.status_signal.emit(arquivo, 'Já existe', data_str, hora_str)
+                self.log_operacao(arquivo, 'Já existe', data_str, hora_str)
+                return 0
+            if not self.validar_xml(caminho_arquivo):
+                self.status_signal.emit(arquivo, 'XML Inválido', data_str, hora_str)
+                self.log_operacao(arquivo, 'XML Inválido', data_str, hora_str)
+                return 0
             shutil.copy2(caminho_arquivo, destino_final)
-            self.adicionar_status(arquivo, 'Copiado')
+            self.status_signal.emit(arquivo, 'Copiado', data_str, hora_str)
             self.log_operacao(arquivo, 'Copiado', data_str, hora_str)
             return 1
         except Exception as e:
-            self.adicionar_status(arquivo, f'Erro: {e}')
+            self.status_signal.emit(arquivo, f'Erro: {e}', data_str, hora_str)
             self.log_operacao(arquivo, 'Erro', data_str, hora_str, str(e))
             return 0
 
@@ -298,29 +313,35 @@ class VerificadorNFCe(QWidget):
             return 0
         total_copiados = 0
         tarefas = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            for subpasta in os.listdir(origem):
-                caminho_mes = os.path.join(origem, subpasta)
-                if os.path.isdir(caminho_mes) and subpasta.lower().startswith('mes'):
-                    arquivos_xml = [f for f in os.listdir(caminho_mes) if f.lower().endswith('.xml')]
-                    if not arquivos_xml:
-                        continue
-                    for arquivo in arquivos_xml:
-                        caminho_arquivo = os.path.join(caminho_mes, arquivo)
-                        ano = self.extrair_ano_da_origem(origem)
-                        mes = subpasta.upper()
-                        pdv = f"PDV-{arquivo[22:25]}"
-                        pasta_destino = self.criar_estrutura_pastas(os.path.join(destino_base, 'NFCE'), ano, pdv, mes)
-                        destino_final = os.path.join(pasta_destino, arquivo)
-                        agora = datetime.datetime.now()
-                        data_str = agora.strftime('%d/%m/%Y')
-                        hora_str = agora.strftime('%H:%M:%S')
-                        tarefas.append(executor.submit(
-                            self.processar_arquivo,
-                            arquivo, caminho_arquivo, ano, mes, pdv, pasta_destino, destino_final, mostrar_ja_existe, data_str, hora_str
-                        ))
-            for future in concurrent.futures.as_completed(tarefas):
-                total_copiados += future.result()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                for subpasta in os.listdir(origem):
+                    caminho_mes = os.path.join(origem, subpasta)
+                    if os.path.isdir(caminho_mes) and subpasta.lower().startswith('mes'):
+                        arquivos_xml = [f for f in os.listdir(caminho_mes) if f.lower().endswith('.xml')]
+                        if not arquivos_xml:
+                            continue
+                        for arquivo in arquivos_xml:
+                            caminho_arquivo = os.path.join(caminho_mes, arquivo)
+                            ano = self.extrair_ano_da_origem(origem)
+                            mes = subpasta.upper()
+                            pdv = f"PDV-{arquivo[22:25]}"
+                            pasta_destino = self.criar_estrutura_pastas(os.path.join(destino_base, 'NFCE'), ano, pdv, mes)
+                            destino_final = os.path.join(pasta_destino, arquivo)
+                            agora = datetime.datetime.now()
+                            data_str = agora.strftime('%d/%m/%Y')
+                            hora_str = agora.strftime('%H:%M:%S')
+                            tarefas.append(executor.submit(
+                                self.processar_arquivo,
+                                arquivo, caminho_arquivo, ano, mes, pdv, pasta_destino, destino_final, mostrar_ja_existe, data_str, hora_str
+                            ))
+                for future in concurrent.futures.as_completed(tarefas):
+                    try:
+                        total_copiados += future.result()
+                    except Exception as e:
+                        print(f'Erro em thread de cópia: {e}')
+        except Exception as e:
+            print(f'Erro no ciclo de monitoramento: {e}')
         return total_copiados
 
     def extrair_ano_da_origem(self, origem):
