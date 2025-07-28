@@ -238,6 +238,9 @@ class VerificadorNFCe(QWidget):
             if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 1024 * 1024:
                 with open(LOG_FILE, 'w', encoding='utf-8') as f:
                     f.write('')  # Limpa o log
+            # Só registrar alterações reais
+            if status not in ['Copiado', 'XML Inválido'] and not (status.startswith('Erro')):
+                return
             with open(LOG_FILE, 'a', encoding='utf-8') as f:
                 linha = f'{data} {hora} | {arquivo} | {status}'
                 if erro:
