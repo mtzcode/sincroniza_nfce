@@ -36,8 +36,13 @@ class VerificadorNFCe(QWidget):
         # Conectar sinais
         self.status_signal.connect(self._adicionar_status_threadsafe)
         self.status_geral_signal.connect(self._adicionar_status_geral_threadsafe)
-        # Inicia o monitoramento automaticamente
-        self.toggle_monitoramento()
+        self._monitoramento_iniciado = False  # Flag para garantir início único
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._monitoramento_iniciado:
+            self.toggle_monitoramento()
+            self._monitoramento_iniciado = True
 
     def init_ui(self):
         main_layout = QVBoxLayout()
@@ -280,11 +285,11 @@ class VerificadorNFCe(QWidget):
     def _adicionar_status_geral_threadsafe(self, status, data_str, hora_str):
         if self.status_table.rowCount() > 0:
             last_row = self.status_table.rowCount() - 1
-            if self.status_table.item(last_row, 0) and self.status_table.item(last_row, 0).text() == '---':
+            if self.status_table.item(last_row, 0) and self.status_table.item(last_row, 0).text() == 'Verificados':
                 self.status_table.removeRow(last_row)
         row = self.status_table.rowCount()
         self.status_table.insertRow(row)
-        self.status_table.setItem(row, 0, QTableWidgetItem('---'))
+        self.status_table.setItem(row, 0, QTableWidgetItem('Verificados'))
         self.status_table.setItem(row, 1, QTableWidgetItem(status))
         self.status_table.setItem(row, 2, QTableWidgetItem(data_str))
         self.status_table.setItem(row, 3, QTableWidgetItem(hora_str))
