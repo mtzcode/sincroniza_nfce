@@ -6,6 +6,7 @@ import shutil
 import threading
 import time
 import xml.etree.ElementTree as ET
+import re
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QLineEdit, QFileDialog,
     QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QSpinBox,
@@ -21,7 +22,7 @@ import tempfile
 CONFIG_FILE = 'config.json'
 LOG_FILE = 'log.txt'
 
-VERSION = "1.0.1"
+VERSION = "1.0.3"
 GITHUB_REPO = "mtzcode/sincroniza_nfce"
 GITHUB_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -85,20 +86,99 @@ class VerificadorNFCe(QWidget):
         
         # Inicializar interface
         self.init_ui()
+        
+        # Flag para controlar se deve mostrar a janela
+        self.deve_mostrar_janela = False
+        
+        # Flag para controlar se o usuário abriu manualmente
+        self.usuario_abriu_manualmente = False
+        
+        # Carregar configuração (isso pode alterar a flag)
         self.load_config()
+        
         self.create_tray_icon()
         
         # Timer para verificação periódica (alternativa mais estável)
         self.timer_verificacao = QTimer()
         self.timer_verificacao.timeout.connect(self.verificacao_timer)
         self.primeira_verificacao = True
+        
+        # A janela será mostrada apenas se necessário (configuração pendente)
+        # Não mostrar automaticamente no início se tudo estiver configurado
+        if not self.deve_mostrar_janela:
+            # Esconder a janela se tudo estiver configurado
+            self.hide()
+        else:
+            # Mostrar a janela se houver configuração pendente
+            self.usuario_abriu_manualmente = False  # Resetar flag
+            QTimer.singleShot(500, self.showNormal)
 
     def showEvent(self, event):
         super().showEvent(event)
         if not self._monitoramento_iniciado:
             # Aguardar um pouco antes de iniciar automaticamente
-            QTimer.singleShot(1000, self.toggle_monitoramento)
+            QTimer.singleShot(1000, self.iniciar_automaticamente)
             self._monitoramento_iniciado = True
+        else:
+            # Se não for a primeira vez, verificar se deve minimizar
+            # IMPORTANTE: NUNCA minimizar se o usuário abriu manualmente
+            if self.usuario_abriu_manualmente:
+                return  # Sair sem fazer nada se o usuário abriu manualmente
+                
+            if self.monitorando and not self.deve_mostrar_janela:
+                # Aguardar um pouco antes de minimizar para dar tempo do usuário ver
+                QTimer.singleShot(1000, self.minimizar_para_bandeja)
+            elif not self.monitorando and self.deve_mostrar_janela:
+                # Se não estiver monitorando e deve mostrar, manter visível
+                pass
+
+    def iniciar_automaticamente(self):
+        """Inicia o monitoramento automaticamente e decide se deve mostrar ou minimizar"""
+        # Verificar se as pastas estão configuradas
+        if not self.origem_edit.text() or not self.destino_edit.text():
+            # Pastas não configuradas - mostrar na tela para o usuário configurar
+            self.adicionar_status_geral("Configure as pastas de origem e destino")
+            self.deve_mostrar_janela = True
+            self.usuario_abriu_manualmente = False  # Resetar flag
+            # Mostrar a janela para o usuário configurar
+            self.showNormal()
+            self.activateWindow()
+            return
+        
+        # Pastas configuradas - iniciar monitoramento
+        self.monitorando = True
+        self.iniciar_btn.setText('Parar Monitoramento')
+        self.status_table.setRowCount(0)
+        self.primeira_verificacao = True
+        
+        # Usar timer ao invés de thread para maior estabilidade
+        intervalo_ms = self.intervalo_spin.value() * 1000
+        self.timer_verificacao.start(intervalo_ms)
+        
+        self.adicionar_status_geral("Monitoramento iniciado automaticamente")
+        
+        # Se tudo estiver funcionando, minimizar para a bandeja
+        self.deve_mostrar_janela = False
+        self.usuario_abriu_manualmente = False  # Resetar flag
+        # Aguardar um pouco para mostrar o status e depois minimizar
+        QTimer.singleShot(2000, self.minimizar_para_bandeja)
+
+    def minimizar_para_bandeja(self):
+        """Minimiza o aplicativo para a bandeja do sistema"""
+        # NUNCA minimizar se o usuário abriu manualmente
+        if self.usuario_abriu_manualmente:
+            return
+            
+        if (self.monitorando and self.origem_edit.text() and self.destino_edit.text() 
+            and not self.deve_mostrar_janela):
+            self.hide()
+            if self.tray_icon:
+                self.tray_icon.showMessage(
+                    'Verificador NFC-e',
+                    'Monitoramento ativo. O aplicativo está rodando na bandeja do sistema.',
+                    QSystemTrayIcon.Information,
+                    3000
+                )
 
     def init_ui(self):
         main_layout = QVBoxLayout()
@@ -175,12 +255,16 @@ class VerificadorNFCe(QWidget):
         filtro_layout.addWidget(QLabel('Status:'))
         self.filtro_status = QComboBox()
         self.filtro_status.addItem('Todos')
-        self.filtro_status.addItems(['Copiado', 'Já existe', 'Erro'])
+        self.filtro_status.addItems(['Copiado', 'Já existe', 'Erro', 'XML Inválido'])
         filtro_layout.addWidget(self.filtro_status)
         
         self.btn_atualizar_historico = QPushButton('Atualizar Histórico')
         self.btn_atualizar_historico.clicked.connect(self.atualizar_historico)
         filtro_layout.addWidget(self.btn_atualizar_historico)
+        
+        self.btn_limpar_filtros = QPushButton('Limpar Filtros')
+        self.btn_limpar_filtros.clicked.connect(self.limpar_filtros_historico)
+        filtro_layout.addWidget(self.btn_limpar_filtros)
         historico_layout.addLayout(filtro_layout)
         
         self.tabela_historico = QTableWidget(0, 4)
@@ -195,11 +279,15 @@ class VerificadorNFCe(QWidget):
 
     def intervalo_alterado(self):
         """Atualiza o timer quando o intervalo é alterado"""
+        # Resetar flag quando o usuário interagir com a interface
+        self.usuario_abriu_manualmente = False
         if self.monitorando:
             self.timer_verificacao.setInterval(self.intervalo_spin.value() * 1000)
 
     def verificar_agora(self):
         """Executa uma verificação manual imediata"""
+        # Resetar flag quando o usuário interagir com a interface
+        self.usuario_abriu_manualmente = False
         self.verificar_agora_btn.setEnabled(False)
         self.verificar_agora_btn.setText('Verificando...')
         
@@ -214,6 +302,13 @@ class VerificadorNFCe(QWidget):
         finally:
             self.verificar_agora_btn.setEnabled(True)
             self.verificar_agora_btn.setText('Verificar Agora')
+            
+            # Minimizar para a bandeja após verificação manual (se estiver monitorando)
+            if self.monitorando:
+                self.deve_mostrar_janela = False
+                self.usuario_abriu_manualmente = False  # Resetar flag
+                # Aguardar um pouco para mostrar o status e depois minimizar
+                QTimer.singleShot(2000, self.minimizar_para_bandeja)
 
     def verificacao_timer(self):
         """Executa verificação pelo timer"""
@@ -227,6 +322,11 @@ class VerificadorNFCe(QWidget):
         except Exception as e:
             self.adicionar_status_geral(f"Erro na verificação: {e}")
             print(f"Erro na verificação timer: {e}")
+            # Mostrar na tela quando houver erro
+            self.deve_mostrar_janela = True
+            self.usuario_abriu_manualmente = False  # Resetar flag
+            self.showNormal()
+            self.activateWindow()
 
     def create_tray_icon(self):
         # Tenta usar um ícone customizado, senão usa o padrão do Qt
@@ -254,16 +354,30 @@ class VerificadorNFCe(QWidget):
 
     def on_tray_icon_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
-            self.showNormal()
-            self.activateWindow()
+            # Marcar que o usuário abriu manualmente ANTES de mostrar a janela
+            self.usuario_abriu_manualmente = True
+            # Aguardar um pouco para garantir que a flag seja processada
+            QTimer.singleShot(100, self.mostrar_janela_usuario)
+
+    def mostrar_janela_usuario(self):
+        """Mostra a janela quando o usuário clica no ícone da bandeja"""
+        self.showNormal()
+        self.activateWindow()
+        # Garantir que a janela permaneça visível
+        self.raise_()
+        self.setFocus()
 
     def selecionar_origem(self):
+        # Resetar flag quando o usuário interagir com a interface
+        self.usuario_abriu_manualmente = False
         pasta = QFileDialog.getExistingDirectory(self, 'Selecionar Pasta de Origem')
         if pasta:
             self.origem_edit.setText(pasta)
             self.save_config()
 
     def selecionar_destino(self):
+        # Resetar flag quando o usuário interagir com a interface
+        self.usuario_abriu_manualmente = False
         pasta = QFileDialog.getExistingDirectory(self, 'Selecionar Pasta de Destino')
         if pasta:
             self.destino_edit.setText(pasta)
@@ -277,10 +391,25 @@ class VerificadorNFCe(QWidget):
                 self.origem_edit.setText(config.get('origem', ''))
                 self.destino_edit.setText(config.get('destino', ''))
                 self.intervalo_spin.setValue(config.get('intervalo', 10))
+                
+                # Verificar se as pastas estão configuradas
+                if not config.get('origem') or not config.get('destino'):
+                    self.deve_mostrar_janela = True
+                    self.usuario_abriu_manualmente = False  # Resetar flag
+                else:
+                    self.deve_mostrar_janela = False
             except Exception as e:
                 print(f'Erro ao carregar configuração: {e}')
+                self.deve_mostrar_janela = True
+                self.usuario_abriu_manualmente = False  # Resetar flag
+        else:
+            # Arquivo de configuração não existe - deve mostrar para configurar
+            self.deve_mostrar_janela = True
+            self.usuario_abriu_manualmente = False  # Resetar flag
 
     def save_config(self):
+        # Resetar flag quando o usuário salvar configuração
+        self.usuario_abriu_manualmente = False
         config = {
             'origem': self.origem_edit.text(),
             'destino': self.destino_edit.text(),
@@ -293,6 +422,8 @@ class VerificadorNFCe(QWidget):
             print(f'Erro ao salvar configuração: {e}')
 
     def toggle_monitoramento(self):
+        # Resetar flag quando o usuário interagir com a interface
+        self.usuario_abriu_manualmente = False
         if not self.monitorando:
             # Verificar se as pastas foram configuradas
             if not self.origem_edit.text() or not self.destino_edit.text():
@@ -309,11 +440,23 @@ class VerificadorNFCe(QWidget):
             self.timer_verificacao.start(intervalo_ms)
             
             self.adicionar_status_geral("Monitoramento iniciado")
+            
+            # Minimizar para a bandeja após iniciar
+            self.deve_mostrar_janela = False
+            self.usuario_abriu_manualmente = False  # Resetar flag
+            # Aguardar um pouco para mostrar o status e depois minimizar
+            QTimer.singleShot(2000, self.minimizar_para_bandeja)
         else:
             self.monitorando = False
             self.iniciar_btn.setText('Iniciar Monitoramento')
             self.timer_verificacao.stop()
             self.adicionar_status_geral("Monitoramento parado")
+            
+            # Mostrar na tela quando parar o monitoramento
+            self.deve_mostrar_janela = True
+            self.usuario_abriu_manualmente = False  # Resetar flag
+            self.showNormal()
+            self.activateWindow()
 
     def fechar_aplicacao(self):
         """Fecha completamente a aplicação"""
@@ -326,6 +469,8 @@ class VerificadorNFCe(QWidget):
     def closeEvent(self, event):
         # Minimiza para a bandeja ao fechar
         event.ignore()
+        # Resetar flag quando o usuário fechar
+        self.usuario_abriu_manualmente = False
         self.hide()
         if self.tray_icon:
             self.tray_icon.showMessage(
@@ -339,6 +484,8 @@ class VerificadorNFCe(QWidget):
         # Minimiza para a bandeja ao minimizar
         if event.type() == 105:  # QEvent.WindowStateChange
             if self.isMinimized():
+                # Resetar flag quando o usuário minimizar
+                self.usuario_abriu_manualmente = False
                 self.hide()
                 if self.tray_icon:
                     self.tray_icon.showMessage(
@@ -361,10 +508,8 @@ class VerificadorNFCe(QWidget):
                 with open(LOG_FILE, 'w', encoding='utf-8') as f:
                     f.write('')  # Limpa o log
             
-            # Só registrar alterações reais
-            if status not in ['Copiado', 'XML Inválido'] and not (status.startswith('Erro')):
-                return
-                
+            # Registrar TODOS os status para o histórico
+            # Removido o filtro que impedia alguns status de serem registrados
             with open(LOG_FILE, 'a', encoding='utf-8') as f:
                 linha = f'{data} {hora} | {arquivo} | {status}'
                 if erro:
@@ -438,10 +583,20 @@ class VerificadorNFCe(QWidget):
         destino_base = self.destino_edit.text()
         
         if not origem or not destino_base:
+            # Mostrar na tela quando não houver configuração
+            self.deve_mostrar_janela = True
+            self.usuario_abriu_manualmente = False  # Resetar flag
+            self.showNormal()
+            self.activateWindow()
             return 0
         
         if not os.path.exists(origem):
             self.adicionar_status_geral("Pasta de origem não encontrada")
+            # Mostrar na tela quando houver problema com pastas
+            self.deve_mostrar_janela = True
+            self.usuario_abriu_manualmente = False  # Resetar flag
+            self.showNormal()
+            self.activateWindow()
             return 0
         
         total_copiados = 0
@@ -465,11 +620,8 @@ class VerificadorNFCe(QWidget):
                             ano = self.extrair_ano_da_origem(origem)
                             mes = subpasta.upper()
                             
-                            # Verificar se o arquivo tem o formato esperado
-                            if len(arquivo) >= 25:
-                                pdv = f"PDV-{arquivo[22:25]}"
-                            else:
-                                pdv = "PDV-000"
+                            # Extrair PDV baseado no tipo de arquivo
+                            pdv = self.extrair_pdv_do_arquivo(arquivo)
                             
                             pasta_destino = self.criar_estrutura_pastas(
                                 os.path.join(destino_base, 'NFCE'), ano, pdv, mes
@@ -492,6 +644,54 @@ class VerificadorNFCe(QWidget):
         
         return total_copiados
 
+    def extrair_pdv_do_arquivo(self, nome_arquivo):
+        """
+        Extrai o número do PDV baseado no tipo de arquivo.
+        Detecta automaticamente se é NFCe ou InutNFCe e extrai das posições corretas.
+        """
+        try:
+            # Remover extensão .xml se existir
+            nome_sem_ext = nome_arquivo.replace('.xml', '')
+            
+            # Verificar se é arquivo de inutilização (InutNFCe)
+            if 'InutNFCe' in nome_arquivo:
+                # Para InutNFCe: posições 21-23 (ex: 35252434286900018265031000001542000001542-InutNFCe.xml)
+                if len(nome_sem_ext) >= 23:
+                    pdv_numero = nome_sem_ext[20:23]  # Posições 21-23 (0-indexed)
+                    print(f"DEBUG - InutNFCe detectado: {nome_arquivo} -> PDV: {pdv_numero}")
+                    return f"PDV-{pdv_numero}"
+                else:
+                    print(f"DEBUG - InutNFCe muito curto: {nome_arquivo}")
+                    return "PDV-000"
+            
+            # Para NFCe normal: posições 23-25 (ex: 35250802775652000123650310000000901564004651-NFCe.xml)
+            elif 'NFCe' in nome_arquivo:
+                if len(nome_sem_ext) >= 25:
+                    pdv_numero = nome_sem_ext[22:25]  # Posições 23-25 (0-indexed)
+                    print(f"DEBUG - NFCe detectado: {nome_arquivo} -> PDV: {pdv_numero}")
+                    return f"PDV-{pdv_numero}"
+                else:
+                    print(f"DEBUG - NFCe muito curto: {nome_arquivo}")
+                    return "PDV-000"
+            
+            # Para outros tipos de arquivo, tentar detectar automaticamente
+            else:
+                # Tentar encontrar padrão de 3 dígitos que pode ser o PDV
+                # Procurar por sequência de 3 dígitos após um padrão específico
+                # Padrão: procurar por 3 dígitos após uma sequência de números
+                match = re.search(r'\d{3}(?=\d{11,})', nome_sem_ext)
+                if match:
+                    pdv_numero = match.group()
+                    print(f"DEBUG - Padrão genérico detectado: {nome_arquivo} -> PDV: {pdv_numero}")
+                    return f"PDV-{pdv_numero}"
+                else:
+                    print(f"DEBUG - Nenhum padrão encontrado: {nome_arquivo}")
+                    return "PDV-000"
+                    
+        except Exception as e:
+            print(f"Erro ao extrair PDV do arquivo {nome_arquivo}: {e}")
+            return "PDV-000"
+
     def extrair_ano_da_origem(self, origem):
         partes = origem.split(os.sep)
         for parte in partes:
@@ -503,6 +703,8 @@ class VerificadorNFCe(QWidget):
         return datetime.datetime.now().year
 
     def atualizar_historico(self):
+        # Resetar flag quando o usuário interagir com a interface
+        self.usuario_abriu_manualmente = False
         self.tabela_historico.setRowCount(0)
         data_filtro = self.filtro_data.date().toString('dd/MM/yyyy')
         status_filtro = self.filtro_status.currentText()
@@ -521,21 +723,59 @@ class VerificadorNFCe(QWidget):
                     arquivo_h = partes[1]
                     status_h = partes[2]
                     
-                    if status_filtro != 'Todos' and status_h != status_filtro:
-                        continue
-                    if data_h != data_filtro:
-                        continue
+                    # Lógica de filtros melhorada
+                    deve_mostrar = True
                     
+                    # Filtro de status
+                    if status_filtro != 'Todos' and status_h != status_filtro:
+                        deve_mostrar = False
+                    
+                    # Filtro de data - só aplicar se não for "Todos" no status
+                    if deve_mostrar and status_filtro == 'Todos':
+                        # Se status é "Todos", não filtrar por data
+                        pass
+                    elif deve_mostrar and data_h != data_filtro:
+                        # Se status não é "Todos", aplicar filtro de data
+                        deve_mostrar = False
+                    
+                    # Adicionar linha se deve mostrar
+                    if deve_mostrar:
+                        row = self.tabela_historico.rowCount()
+                        self.tabela_historico.insertRow(row)
+                        self.tabela_historico.setItem(row, 0, QTableWidgetItem(data_h))
+                        self.tabela_historico.setItem(row, 1, QTableWidgetItem(hora_h))
+                        self.tabela_historico.setItem(row, 2, QTableWidgetItem(arquivo_h))
+                        self.tabela_historico.setItem(row, 3, QTableWidgetItem(status_h))
+                
+                # Mostrar mensagem se não houver resultados
+                if self.tabela_historico.rowCount() == 0:
                     row = self.tabela_historico.rowCount()
                     self.tabela_historico.insertRow(row)
-                    self.tabela_historico.setItem(row, 0, QTableWidgetItem(data_h))
-                    self.tabela_historico.setItem(row, 1, QTableWidgetItem(hora_h))
-                    self.tabela_historico.setItem(row, 2, QTableWidgetItem(arquivo_h))
-                    self.tabela_historico.setItem(row, 3, QTableWidgetItem(status_h))
+                    self.tabela_historico.setItem(row, 0, QTableWidgetItem("Nenhum resultado"))
+                    self.tabela_historico.setItem(row, 1, QTableWidgetItem(""))
+                    self.tabela_historico.setItem(row, 2, QTableWidgetItem(""))
+                    self.tabela_historico.setItem(row, 3, QTableWidgetItem(""))
+                        
         except Exception as e:
             print(f'Erro ao atualizar histórico: {e}')
+            # Mostrar erro na interface
+            self.adicionar_status_geral(f"Erro ao carregar histórico: {e}")
+
+    def limpar_filtros_historico(self):
+        """Limpa os filtros e atualiza o histórico"""
+        # Resetar flag quando o usuário interagir com a interface
+        self.usuario_abriu_manualmente = False
+        
+        # Limpar filtros
+        self.filtro_data.setDate(QDate.currentDate())
+        self.filtro_status.setCurrentText('Todos')
+        
+        # Atualizar histórico
+        self.atualizar_historico()
 
     def verificar_atualizacao(self):
+        # Resetar flag quando o usuário interagir com a interface
+        self.usuario_abriu_manualmente = False
         try:
             self.atualizar_btn.setEnabled(False)
             self.atualizar_btn.setText('Verificando...')
@@ -634,6 +874,7 @@ if __name__ == '__main__':
     app.setQuitOnLastWindowClosed(False)
     
     window = VerificadorNFCe()
-    window.show()
+    # Não mostrar automaticamente - será controlado pela lógica interna
+    # window.show()
     
     sys.exit(app.exec_())
